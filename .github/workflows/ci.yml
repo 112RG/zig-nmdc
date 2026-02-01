@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+
+jobs:
+  lint:
+    name: Check Formatting
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: master
+      - name: Check Format
+        run: zig fmt --check .
+
+  build-and-test:
+    name: Test ${{ matrix.project }}
+    needs: lint
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [lib, server, client]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - uses: mlugg/setup-zig@v1
+        with:
+          version: master
+
+      - name: Build
+        run: cd ${{ matrix.project }} && zig build
+
+      - name: Test
+        run: cd ${{ matrix.project }} && zig build test
