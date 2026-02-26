@@ -1,4 +1,4 @@
-#include "dc_wlock.h"
+#include "dc_lock.h"
 char *lock_to_key(const char *lock)
 {
         int len = strlen(lock);

@@ -12,16 +12,17 @@ pub const DccHub = struct {
 
     pub fn connect(allocator: std.mem.Allocator, address: std.net.Address) !DccHub {
         const connection = try net.tcpConnectToAddress(address);
+        var buffer: [4096]u8 = undefined;
         return DccHub{
             .allocator = allocator,
             .connection = connection,
-            .writer = connection.writer(),
+            .writer = connection.writer(&buffer),
         };
     }
 
     fn write(self: DccHub, message: []const u8) !void {
         std.debug.print("Sending: {s}\n", .{message});
-        try self.writer.writeAll(message);
+        _ = try self.connection.write(message);
     }
     pub fn processMessage(self: DccHub, message: []const u8) !void {
         var _message = std.mem.splitAny(u8, message, "|");
@@ -33,7 +34,7 @@ pub const DccHub = struct {
             const params = command_message.rest();
             const action = std.meta.stringToEnum(Command, command) orelse return;
 
-            std.debug.print("Command: {s} Params: {s}\n", .{ command, params });
+            std.debug.print("Command: {s} Params: {s}\n", .{ @as([]const u8, command), @as([]const u8, params) });
             switch (action) {
                 .Lock => {
                     try self.handleLock(params);
@@ -54,7 +55,7 @@ pub const DccHub = struct {
     }
 
     fn handleSupports(_params: []const u8) !void {
-        std.debug.print("{s}\n", .{_params});
+        std.debug.print("{any}\n", .{_params});
     }
     fn handleLock(self: DccHub, _params: []const u8) !void {
         var params = splitCommandParams(_params);

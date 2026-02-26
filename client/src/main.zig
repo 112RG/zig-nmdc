@@ -18,7 +18,7 @@ pub fn main() !void {
     const dccHub = try hub.connect(allocator, address);
     defer dccHub.connection.close();
 
-    print("Connecting to {}\n", .{address});
+    print("Connecting to {any}\n", .{address});
     const bufferSize: usize = 4096; // Adjust buffer size according to your needs
     var buffer: [bufferSize]u8 = undefined;
 
