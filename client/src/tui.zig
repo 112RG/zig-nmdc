@@ -7,11 +7,15 @@ var mutex: std.Thread.Mutex = .{};
 var orig_termios: posix.termios = undefined;
 var is_raw_mode = false;
 var g_allocator: std.mem.Allocator = undefined;
-const stdin_fd = std.io.getStdIn().handle;
+
+// Buffer for stderr output
+var stderr_buffer: [4096]u8 = undefined;
+
+const stdin_file = std.fs.File.stdin();
 
 pub fn init(allocator: std.mem.Allocator) !void {
     g_allocator = allocator;
-    input_buffer = std.ArrayList(u8).init(allocator);
+    input_buffer = try std.ArrayList(u8).initCapacity(allocator, 0);
 
     // Enable raw mode
     try enableRawMode();
@@ -19,12 +23,12 @@ pub fn init(allocator: std.mem.Allocator) !void {
 
 pub fn deinit() void {
     disableRawMode();
-    input_buffer.deinit();
+    input_buffer.deinit(g_allocator);
 }
 
 fn enableRawMode() !void {
     if (is_raw_mode) return;
-    orig_termios = try posix.tcgetattr(stdin_fd);
+    orig_termios = try posix.tcgetattr(stdin_file.handle);
     var raw = orig_termios;
     // ECHO | ICANON | ISIG | IEXTEN
     raw.lflag.ECHO = false;
@@ -43,13 +47,13 @@ fn enableRawMode() !void {
     // CS8
     raw.cflag.CSIZE = .CS8;
 
-    try posix.tcsetattr(stdin_fd, .FLUSH, raw);
+    try posix.tcsetattr(stdin_file.handle, .FLUSH, raw);
     is_raw_mode = true;
 }
 
 pub fn disableRawMode() void {
     if (!is_raw_mode) return;
-    posix.tcsetattr(stdin_fd, .FLUSH, orig_termios) catch {};
+    posix.tcsetattr(stdin_file.handle, .FLUSH, orig_termios) catch {};
     is_raw_mode = false;
 }
 
@@ -62,12 +66,13 @@ pub fn logFn(
     mutex.lock();
     defer mutex.unlock();
 
-    const stderr = std.io.getStdErr().writer();
+    var stderr_file_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    const stderr_w = &stderr_file_writer.interface;
 
     // Clear current line
     // \r: Move to begin of line
     // \x1b[2K: Clear entire line
-    stderr.print("\r\x1b[2K", .{}) catch {};
+    stderr_w.print("\r\x1b[2K", .{}) catch {};
 
     // Print log
     const color = switch (level) {
@@ -79,10 +84,10 @@ pub fn logFn(
     const reset = "\x1b[0m";
     const scope_txt = if (scope == .default) "" else "(" ++ @tagName(scope) ++ ") ";
 
-    stderr.print("{s}[{s}] {s}{s}" ++ format ++ "\n", .{ color, @tagName(level), scope_txt, reset } ++ args) catch {};
+    stderr_w.print("{s}[{s}] {s}{s}" ++ format ++ "\n", .{ color, @tagName(level), scope_txt, reset } ++ args) catch {};
 
     // Redraw prompt and input
-    renderInput(stderr) catch {};
+    renderInput(stderr_w) catch {};
 }
 
 fn renderInput(writer: anytype) !void {
@@ -91,37 +96,39 @@ fn renderInput(writer: anytype) !void {
     writer.print("\r> {s}", .{input_buffer.items}) catch {};
 }
 
-// Returns a complete line if Enter is pressed, null otherwise
-pub fn processInput() !?[]u8 {
-    const stdin = std.io.getStdIn().reader();
-
-    // Blocking read for 1 byte (Main thread blocks here, logFn in other threads can take mutex)
-    const byte = stdin.readByte() catch return null;
+// Returns a complete line if Enter is pressed, empty slice on error
+pub fn processInput() anyerror![]u8 {
+    // Blocking read for 1 byte using deprecated read method
+    var byte_buf: [1]u8 = undefined;
+    const bytes_read = stdin_file.read(&byte_buf) catch return &.{};
+    if (bytes_read == 0) return &.{};
+    const byte = byte_buf[0];
 
     mutex.lock();
     defer mutex.unlock();
 
-    const stderr = std.io.getStdErr().writer();
+    var stderr_file_writer = std.fs.File.stderr().writer(&stderr_buffer);
+    const stderr_w = &stderr_file_writer.interface;
 
     switch (byte) {
         13 => { // Enter (\r)
             // Print newline so the command stays in history block
-            try stderr.print("\r\n", .{});
+            try stderr_w.print("\r\n", .{});
 
-            const line = try input_buffer.toOwnedSlice();
+            const line = input_buffer.toOwnedSlice(g_allocator);
             // Re-init buffer
-            input_buffer = std.ArrayList(u8).init(g_allocator);
+            input_buffer = try std.ArrayList(u8).initCapacity(g_allocator, 0);
 
             // Redraw prompt
-            try renderInput(stderr);
+            try renderInput(stderr_w);
 
             return line;
         },
         127, 8 => { // Backspace
             if (input_buffer.items.len > 0) {
                 _ = input_buffer.pop();
-                try stderr.print("\r\x1b[2K", .{});
-                try renderInput(stderr);
+                try stderr_w.print("\r\x1b[2K", .{});
+                try renderInput(stderr_w);
             }
         },
         3 => { // Ctrl-C
@@ -130,11 +137,11 @@ pub fn processInput() !?[]u8 {
         },
         else => {
             if (byte >= 32 and byte < 127) {
-                try input_buffer.append(byte);
+                try input_buffer.append(g_allocator, byte);
                 // Optimization: just print the char instead of full redraw if at end
-                try stderr.print("{c}", .{byte});
+                try stderr_w.print("{c}", .{byte});
             }
         },
     }
-    return null;
+    return &.{};
 }

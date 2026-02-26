@@ -74,19 +74,19 @@ pub const NMDC = struct {
         }
 
         // Step 3: Escape special characters
-        var escaped_key = std.ArrayList(u8).init(allocator);
-        errdefer escaped_key.deinit();
+        var escaped_key = try std.ArrayList(u8).initCapacity(allocator, key.len);
+        errdefer escaped_key.deinit(allocator);
 
         for (key) |byte| {
             switch (byte) {
                 0, 5, 36, 96, 124, 126 => {
-                    try escaped_key.writer().print("/%DCN{d:0>3}%/", .{byte});
+                    try escaped_key.writer(allocator).print("/%DCN{d:0>3}%/", .{byte});
                 },
-                else => try escaped_key.append(byte),
+                else => try escaped_key.append(allocator, byte),
             }
         }
 
-        return escaped_key.toOwnedSlice();
+        return escaped_key.toOwnedSlice(allocator);
     }
 };
 
