@@ -9,8 +9,9 @@ const Allocator = std.mem.Allocator;
 const c = @cImport({
     @cInclude("dc_lock.c");
 });
+
 pub fn main() !void {
-    const address = try net.Address.parseIp4("127.0.0.1", 1411);
+    const address = try net.Address.parseIp4("10.0.1.141", 411);
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
     //const conn = try net.tcpConnectToAddress(hub);

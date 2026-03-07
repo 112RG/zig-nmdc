@@ -2,9 +2,11 @@ const std = @import("std");
 const net = std.net;
 
 const Command = enum { Lock, Hello, Supports, HubName };
+
 const c = @cImport({
     @cInclude("dc_lock.c");
 });
+
 pub const DccHub = struct {
     allocator: std.mem.Allocator,
     connection: std.net.Stream,
@@ -57,6 +59,7 @@ pub const DccHub = struct {
     fn handleSupports(_params: []const u8) !void {
         std.debug.print("{any}\n", .{_params});
     }
+
     fn handleLock(self: DccHub, _params: []const u8) !void {
         var params = splitCommandParams(_params);
         const lock = params.first();
