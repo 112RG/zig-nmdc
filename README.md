@@ -1,3 +1,11 @@
+<h1 align="center">zig-nmdc</h1>
+<div align="center"
+
+[![license](https://img.shields.io/github/license/112RG/zig-nmdc)](https://github.com/112RG/zig-nmdc/blob/master/LICENSE)
+![GitHub repo size](https://img.shields.io/github/repo-size/112RG/zig-nmdc)
+![Lines of Code](https://aschey.tech/tokei/github/112RG/zig-nmdc)
+</div>
+
 # Zig NMDC Workspace
 
 A small Zig workspace for experimenting with the NMDC (Direct Connect) protocol.
