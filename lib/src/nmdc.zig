@@ -11,7 +11,18 @@ pub const NMDC = struct {
         Version,
         GetNickList,
         MyINFO,
+        HubName,
+        NickList,
+        Quit,
+        OpList,
+        BotList,
+        LogedIn,
         Unknown,
+    };
+
+    pub const ParsedCommand = struct {
+        kind: CommandType,
+        payload: []const u8,
     };
 
     pub fn getCommandType(msg: []const u8) CommandType {
@@ -23,6 +34,21 @@ pub const NMDC = struct {
 
         const cmd = msg[1..end];
         return std.meta.stringToEnum(CommandType, cmd) orelse .Unknown;
+    }
+
+    pub fn parseCommand(msg: []const u8) ?ParsedCommand {
+        if (msg.len == 0 or msg[0] != '$') return null;
+
+        var end: usize = 1;
+        while (end < msg.len and msg[end] != ' ' and msg[end] != '|') : (end += 1) {}
+
+        const kind = std.meta.stringToEnum(CommandType, msg[1..end]) orelse .Unknown;
+        const payload = if (end < msg.len and msg[end] == ' ') msg[end + 1 ..] else "";
+
+        return .{
+            .kind = kind,
+            .payload = payload,
+        };
     }
 
     pub fn makeMyNick(allocator: std.mem.Allocator, nick: []const u8) ![]u8 {
