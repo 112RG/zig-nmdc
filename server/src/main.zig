@@ -1,71 +1,32 @@
 const std = @import("std");
-const lib = @import("server_lib");
-const nmdc = @import("nmdc").NMDC;
+const hub_mod = @import("hub.zig");
+
+const default_host = "127.0.0.1";
+const default_port: u16 = 4111;
 
 pub fn main() !void {
-    _ = lib;
     const allocator = std.heap.page_allocator;
-    // Port 4111 to match the client
-    const port: u16 = 4111;
+    const args = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, args);
 
-    const loopback = try std.net.Ip4Address.parse("127.0.0.1", port);
-    const self_addr = std.net.Address{ .in = loopback };
+    const host = if (args.len > 1) args[1] else default_host;
+    const port = if (args.len > 2) try std.fmt.parseInt(u16, args[2], 10) else default_port;
+    const address = try std.net.Address.parseIp4(host, port);
 
-    // Listen
-    var server = try std.net.Address.listen(self_addr, .{ .reuse_address = true, .kernel_backlog = 128 });
+    var server = try std.net.Address.listen(address, .{ .reuse_address = true, .kernel_backlog = 128 });
     defer server.deinit();
 
-    std.debug.print("Server listening on 127.0.0.1:{d}...\n", .{port});
+    var hub = hub_mod.Hub{ .allocator = allocator };
+    defer hub.deinit();
+
+    std.debug.print("Hub listening on {any}\n", .{address});
 
     while (true) {
-        // Accept connection
         const connection = try server.accept();
         std.debug.print("Client connected from: {any}\n", .{connection.address});
-
-        // Handle client in a separate function (blocking for now is fine for a test)
-        handleClient(allocator, connection.stream) catch |err| {
-            std.debug.print("Client error: {}\n", .{err});
+        hub.startClient(connection.stream, connection.address) catch |err| {
+            std.debug.print("Failed to start client session: {}\n", .{err});
+            connection.stream.close();
         };
-    }
-}
-
-fn handleClient(allocator: std.mem.Allocator, stream: std.net.Stream) !void {
-    var read_buffer = nmdc.MessageBuffer{};
-    defer read_buffer.deinit(allocator);
-    defer stream.close();
-
-    // 1. Send $Lock
-    // Format: $Lock <LOCK> Pk=<PK>|
-    const lock_msg = "$Lock EXTENDEDPROTOCOLABC Pk=ZigNMDC1.0.0|";
-    try stream.writeAll(lock_msg);
-    std.debug.print("Sent: {s}\n", .{lock_msg});
-
-    var buf: [4096]u8 = undefined;
-
-    // 2. Read loop
-    while (true) {
-        const bytes_read = try stream.read(buf[0..]);
-        if (bytes_read == 0) return;
-
-        try read_buffer.append(allocator, buf[0..bytes_read]);
-
-        while (read_buffer.next()) |line| {
-            if (line.len == 0) continue;
-            std.debug.print("Received: {s}\n", .{line});
-
-            switch (nmdc.parseMessage(line)) {
-                .command => |command| switch (command.kind) {
-                    .ValidateNick => {
-                        const hello = try nmdc.makeHello(allocator, command.payload);
-                        defer allocator.free(hello);
-                        try stream.writeAll(hello);
-                        std.debug.print("Sent: {s}\n", .{hello});
-                    },
-                    else => {},
-                },
-                else => {},
-            }
-        }
-        read_buffer.compact();
     }
 }

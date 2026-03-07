@@ -7,9 +7,15 @@ pub const ChatMessage = struct {
     text: []u8,
 };
 
+pub const PrivateMessage = struct {
+    from: []u8,
+    text: []u8,
+};
+
 pub const Event = union(enum) {
     log: []u8,
     chat: ChatMessage,
+    private_message: PrivateMessage,
     op_list: []u8,
     bot_list: []u8,
     connected,
@@ -23,6 +29,10 @@ pub fn deinitEvent(allocator: std.mem.Allocator, event: *Event) void {
         .chat => |chat| {
             allocator.free(chat.nick);
             allocator.free(chat.text);
+        },
+        .private_message => |message| {
+            allocator.free(message.from);
+            allocator.free(message.text);
         },
         .connected => {},
     }
@@ -80,6 +90,13 @@ pub const DccHub = struct {
         try self.connection.writeAll(payload);
     }
 
+    pub fn sendPrivateMessage(self: *DccHub, target: []const u8, text: []const u8) !void {
+        const payload = try nmdc.makePrivateMessage(self.allocator, target, self.nick, text);
+        defer self.allocator.free(payload);
+
+        try self.connection.writeAll(payload);
+    }
+
     fn drainMessages(self: *DccHub, events: *std.ArrayList(Event)) !void {
         while (self.read_buffer.next()) |raw| {
             if (raw.len != 0) {
@@ -92,6 +109,7 @@ pub const DccHub = struct {
     fn handleMessage(self: *DccHub, message: []const u8, events: *std.ArrayList(Event)) !void {
         switch (nmdc.parseMessage(message)) {
             .chat => |chat| try self.handleChatMessage(chat, events),
+            .private_message => |private_message| try self.handlePrivateMessage(private_message, events),
             .command => |command| try self.handleCommand(command, events),
             .unknown => |raw| try appendLog(events, self.allocator, "Unhandled: {s}", .{raw}),
         }
@@ -129,6 +147,18 @@ pub const DccHub = struct {
         try events.append(self.allocator, .{
             .chat = .{
                 .nick = try self.allocator.dupe(u8, chat.nick),
+                .text = decoded,
+            },
+        });
+    }
+
+    fn handlePrivateMessage(self: *DccHub, message: nmdc.PrivateMessage, events: *std.ArrayList(Event)) !void {
+        const decoded = try nmdc.decodeChatText(self.allocator, message.text);
+        errdefer self.allocator.free(decoded);
+
+        try events.append(self.allocator, .{
+            .private_message = .{
+                .from = try self.allocator.dupe(u8, message.from),
                 .text = decoded,
             },
         });
@@ -201,7 +231,7 @@ test "parseMessage classifies commands" {
     switch (parsed) {
         .command => |command| {
             try std.testing.expectEqual(nmdc.CommandType.Supports, command.kind);
-            try std.testing.expectEqualStrings("NoHello NoGetINFO|", command.payload);
+            try std.testing.expectEqualStrings("NoHello NoGetINFO", command.payload);
         },
         else => return error.UnexpectedMessageKind,
     }

@@ -117,6 +117,15 @@ const ScreenSize = struct {
     rows: u16,
 };
 
+const ParsedInput = union(enum) {
+    chat: []const u8,
+    private_message: struct {
+        nick: []const u8,
+        text: []const u8,
+    },
+    invalid: []const u8,
+};
+
 const Terminal = struct {
     original: c.termios,
     raw_enabled: bool = false,
@@ -256,6 +265,17 @@ const App = struct {
         switch (event.*) {
             .log => |line| try self.addAppLogLocked(.info, "hub", "{s}", .{line}),
             .chat => |chat| try self.addChatLogLocked(chat.nick, chat.text),
+            .private_message => |message| {
+                const line = try formatPrivateMessageLine(
+                    self.allocator,
+                    self.hub.nick,
+                    &self.op_nicks,
+                    &self.bot_nicks,
+                    message.from,
+                    message.text,
+                );
+                try self.chat_logs.appendOwned(line);
+            },
             .op_list => |payload| {
                 const count = try self.op_nicks.replaceFromPayload(payload);
                 try self.addAppLogLocked(.info, "hub", "Updated op list ({d})", .{count});
@@ -369,12 +389,7 @@ fn handleInputByte(app: *App, byte: u8) !bool {
 
             if (maybe_message) |message| {
                 defer app.allocator.free(message);
-                app.hub.sendChat(message) catch |err| {
-                    app.mutex.lock();
-                    defer app.mutex.unlock();
-                    try app.addAppLogLocked(.err, "chat", "Chat send failed: {}", .{err});
-                    try app.renderLocked();
-                };
+                try dispatchInputMessage(app, message);
             }
         },
         127, 8 => {
@@ -396,6 +411,65 @@ fn handleInputByte(app: *App, byte: u8) !bool {
     }
 
     return true;
+}
+
+fn dispatchInputMessage(app: *App, message: []const u8) !void {
+    switch (parseInput(message)) {
+        .chat => |text| {
+            if (text.len == 0) return;
+
+            app.hub.sendChat(text) catch |err| {
+                app.mutex.lock();
+                defer app.mutex.unlock();
+                try app.addAppLogLocked(.err, "chat", "Chat send failed: {}", .{err});
+                try app.renderLocked();
+            };
+        },
+        .private_message => |private_message| {
+            app.hub.sendPrivateMessage(private_message.nick, private_message.text) catch |err| {
+                app.mutex.lock();
+                defer app.mutex.unlock();
+                try app.addAppLogLocked(.err, "chat", "Private message send failed: {}", .{err});
+                try app.renderLocked();
+            };
+        },
+        .invalid => |reason| {
+            app.mutex.lock();
+            defer app.mutex.unlock();
+            try app.addAppLogLocked(.warn, "ui", "{s}", .{reason});
+            try app.renderLocked();
+        },
+    }
+}
+
+fn parseInput(message: []const u8) ParsedInput {
+    const trimmed = std.mem.trim(u8, message, " ");
+    if (trimmed.len == 0) return .{ .chat = "" };
+    if (!std.mem.startsWith(u8, trimmed, "/")) return .{ .chat = trimmed };
+
+    if (std.mem.startsWith(u8, trimmed, "/msg")) {
+        const rest = std.mem.trimLeft(u8, trimmed[4..], " ");
+        if (rest.len == 0) {
+            return .{ .invalid = "Usage: /msg <nick> <message>" };
+        }
+
+        const nick_end = std.mem.indexOfScalar(u8, rest, ' ') orelse {
+            return .{ .invalid = "Usage: /msg <nick> <message>" };
+        };
+        const nick = std.mem.trim(u8, rest[0..nick_end], " ");
+        if (nick.len == 0) {
+            return .{ .invalid = "Usage: /msg <nick> <message>" };
+        }
+
+        const text = std.mem.trimLeft(u8, rest[nick_end + 1 ..], " ");
+        if (text.len == 0) {
+            return .{ .invalid = "Usage: /msg <nick> <message>" };
+        }
+
+        return .{ .private_message = .{ .nick = nick, .text = text } };
+    }
+
+    return .{ .invalid = "Unknown command. Supported: /msg <nick> <message>" };
 }
 
 fn networkThreadMain(app: *App) void {
@@ -555,6 +629,33 @@ fn formatChatLine(
     );
 }
 
+fn formatPrivateMessageLine(
+    allocator: std.mem.Allocator,
+    my_nick: []const u8,
+    op_nicks: *const NickList,
+    bot_nicks: *const NickList,
+    nick: []const u8,
+    text: []const u8,
+) ![]u8 {
+    const timestamp = try makeTimestamp(allocator);
+    defer allocator.free(timestamp);
+
+    const nick_color = if (std.mem.eql(u8, nick, my_nick))
+        ansi_bold_green
+    else if (op_nicks.contains(nick))
+        ansi_bold_red
+    else if (bot_nicks.contains(nick))
+        ansi_bold_magenta
+    else
+        ansi_cyan;
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}[{s}]{s} {s}[pm]{s} {s}{s}{s} {s}",
+        .{ ansi_dim, timestamp, ansi_reset, ansi_magenta, ansi_reset, nick_color, nick, ansi_reset, text },
+    );
+}
+
 fn makeTimestamp(allocator: std.mem.Allocator) ![]u8 {
     const now = std.time.timestamp();
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @as(u64, @intCast(@max(now, 0))) };
@@ -591,7 +692,40 @@ test "writeStyledWidth ignores ansi escape length" {
     try std.testing.expectEqualStrings(ansi_red ++ "hel", list.items);
 }
 
+test "formatPrivateMessageLine includes pm marker" {
+    var ops = NickList{ .allocator = std.testing.allocator };
+    defer ops.deinit();
+    var bots = NickList{ .allocator = std.testing.allocator };
+    defer bots.deinit();
+
+    const line = try formatPrivateMessageLine(std.testing.allocator, "me", &ops, &bots, "alice", "secret");
+    defer std.testing.allocator.free(line);
+
+    try std.testing.expect(std.mem.indexOf(u8, line, "[pm]") != null);
+}
+
 test "tailSlice keeps the rightmost characters" {
     try std.testing.expectEqualStrings("hello", tailSlice("hello", 10));
     try std.testing.expectEqualStrings("llo", tailSlice("hello", 3));
+}
+
+test "parseInput parses private message command" {
+    const parsed = parseInput("/msg alice hello there");
+
+    switch (parsed) {
+        .private_message => |message| {
+            try std.testing.expectEqualStrings("alice", message.nick);
+            try std.testing.expectEqualStrings("hello there", message.text);
+        },
+        else => return error.UnexpectedInputKind,
+    }
+}
+
+test "parseInput rejects malformed msg command" {
+    const parsed = parseInput("/msg alice");
+
+    switch (parsed) {
+        .invalid => |reason| try std.testing.expectEqualStrings("Usage: /msg <nick> <message>", reason),
+        else => return error.ExpectedInvalidInput,
+    }
 }

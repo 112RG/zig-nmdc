@@ -40,6 +40,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const nmdc_mod = b.dependency("lib", .{}).module("nmdc");
+    lib_mod.addImport("nmdc", nmdc_mod);
     exe_mod.addImport("nmdc", nmdc_mod);
 
     // Modules can depend on one another using the `std.Build.Module.addImport` function.
