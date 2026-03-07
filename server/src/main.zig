@@ -1,7 +1,9 @@
 const std = @import("std");
 const lib = @import("server_lib");
+const nmdc = @import("nmdc").NMDC;
 
 pub fn main() !void {
+    _ = lib;
     const allocator = std.heap.page_allocator;
     // Port 4111 to match the client
     const port: u16 = 4111;
@@ -28,37 +30,51 @@ pub fn main() !void {
 }
 
 fn handleClient(allocator: std.mem.Allocator, stream: std.net.Stream) !void {
-    _ = allocator;
+    var read_buffer: std.ArrayList(u8) = .empty;
+    defer read_buffer.deinit(allocator);
     defer stream.close();
-
-    // The client expects newline-delimited messages currently.
-    // We send | and \n to satisfy protocol and client's readUntilDelimiter.
 
     // 1. Send $Lock
     // Format: $Lock <LOCK> Pk=<PK>|
     const lock_msg = "$Lock EXTENDEDPROTOCOLABC Pk=ZigNMDC1.0.0|";
-    try stream.writer().print("{s}\n", .{lock_msg});
+    try stream.writeAll(lock_msg);
     std.debug.print("Sent: {s}\n", .{lock_msg});
 
     var buf: [4096]u8 = undefined;
 
     // 2. Read loop
     while (true) {
-        const msg = stream.reader().readUntilDelimiterOrEof(&buf, '\n') catch |err| {
-            if (err == error.EndOfStream) {
-                return;
-            }
-            return err;
-        };
+        const bytes_read = try stream.read(buf[0..]);
+        if (bytes_read == 0) return;
 
-        if (msg) |line| {
+        try read_buffer.appendSlice(allocator, buf[0..bytes_read]);
+
+        var start: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, read_buffer.items, start, '|')) |end| {
+            const line = std.mem.trim(u8, read_buffer.items[start..end], "\r\n");
+            start = end + 1;
+
+            if (line.len == 0) continue;
             std.debug.print("Received: {s}\n", .{line});
 
-            if (std.mem.startsWith(u8, line, "$Key")) {
-                try stream.writer().print("$Hello ZigUser|\n", .{});
+            switch (nmdc.parseMessage(line)) {
+                .command => |command| switch (command.kind) {
+                    .ValidateNick => {
+                        const hello = try std.fmt.allocPrint(allocator, "$Hello {s}|", .{command.payload});
+                        defer allocator.free(hello);
+                        try stream.writeAll(hello);
+                        std.debug.print("Sent: {s}\n", .{hello});
+                    },
+                    else => {},
+                },
+                else => {},
             }
-        } else {
-            break;
         }
+
+        if (start == 0) continue;
+
+        const remaining = read_buffer.items.len - start;
+        std.mem.copyForwards(u8, read_buffer.items[0..remaining], read_buffer.items[start..]);
+        read_buffer.items.len = remaining;
     }
 }

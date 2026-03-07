@@ -2,12 +2,6 @@ const std = @import("std");
 const net = std.net;
 const nmdc = @import("nmdc").NMDC;
 
-const ParsedMessage = union(enum) {
-    chat: []const u8,
-    command: nmdc.ParsedCommand,
-    unknown: []const u8,
-};
-
 pub const ChatMessage = struct {
     nick: []u8,
     text: []u8,
@@ -76,14 +70,7 @@ pub const DccHub = struct {
     }
 
     pub fn sendChat(self: *DccHub, text: []const u8) !void {
-        const escaped = try escapeChatText(self.allocator, text);
-        defer self.allocator.free(escaped);
-
-        const payload = try std.fmt.allocPrint(
-            self.allocator,
-            "<{s}> {s}|",
-            .{ self.nick, escaped },
-        );
+        const payload = try nmdc.formatChatMessage(self.allocator, self.nick, text);
         defer self.allocator.free(payload);
 
         try self.connection.writeAll(payload);
@@ -108,7 +95,7 @@ pub const DccHub = struct {
     }
 
     fn handleMessage(self: *DccHub, message: []const u8, events: *std.ArrayList(Event)) !void {
-        switch (parseMessage(message)) {
+        switch (nmdc.parseMessage(message)) {
             .chat => |chat| try self.handleChatMessage(chat, events),
             .command => |command| try self.handleCommand(command, events),
             .unknown => |raw| try appendLog(events, self.allocator, "Unhandled: {s}", .{raw}),
@@ -138,33 +125,20 @@ pub const DccHub = struct {
         }
     }
 
-    fn handleChatMessage(self: *DccHub, message: []const u8, events: *std.ArrayList(Event)) !void {
-        const end_nick = std.mem.indexOfScalar(u8, message, '>') orelse {
-            try appendLog(events, self.allocator, "Malformed chat: {s}", .{message});
-            return;
-        };
-        if (end_nick <= 1) return;
-
-        const nick = message[1..end_nick];
-        const text_start = if (message.len > end_nick + 1 and message[end_nick + 1] == ' ')
-            end_nick + 2
-        else
-            end_nick + 1;
-        const raw_text = if (text_start <= message.len) message[text_start..] else "";
-
-        const decoded = try decodeChatText(self.allocator, raw_text);
+    fn handleChatMessage(self: *DccHub, chat: nmdc.ChatLine, events: *std.ArrayList(Event)) !void {
+        const decoded = try nmdc.decodeChatText(self.allocator, chat.text);
         errdefer self.allocator.free(decoded);
 
         try events.append(self.allocator, .{
             .chat = .{
-                .nick = try self.allocator.dupe(u8, nick),
+                .nick = try self.allocator.dupe(u8, chat.nick),
                 .text = decoded,
             },
         });
     }
 
     fn handleLock(self: *DccHub, payload: []const u8, events: *std.ArrayList(Event)) !void {
-        const lock = firstWord(payload) orelse return;
+        const lock = nmdc.firstWord(payload) orelse return;
         const key = try nmdc.calculateKey(self.allocator, lock);
         defer self.allocator.free(key);
 
@@ -203,23 +177,6 @@ pub const DccHub = struct {
     }
 };
 
-fn parseMessage(message: []const u8) ParsedMessage {
-    if (message.len == 0) return .{ .unknown = message };
-    if (message[0] == '<') return .{ .chat = message };
-    if (nmdc.parseCommand(message)) |command| {
-        return .{ .command = command };
-    }
-    return .{ .unknown = message };
-}
-
-fn firstWord(text: []const u8) ?[]const u8 {
-    const trimmed = std.mem.trim(u8, text, " ");
-    if (trimmed.len == 0) return null;
-
-    const end = std.mem.indexOfScalar(u8, trimmed, ' ') orelse trimmed.len;
-    return trimmed[0..end];
-}
-
 fn appendLog(
     events: *std.ArrayList(Event),
     allocator: std.mem.Allocator,
@@ -240,58 +197,56 @@ fn countNickListEntries(payload: []const u8) usize {
     return count;
 }
 
-fn escapeChatText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var output: std.ArrayList(u8) = .empty;
-    errdefer output.deinit(allocator);
+test "parseMessage classifies chat lines" {
+    const parsed = nmdc.parseMessage("<alice> hello");
 
-    for (text) |byte| {
-        switch (byte) {
-            '\n', '\r' => try output.append(allocator, ' '),
-            '&' => try output.appendSlice(allocator, "&amp;"),
-            '$' => try output.appendSlice(allocator, "&#36;"),
-            '|' => try output.appendSlice(allocator, "&#124;"),
-            else => try output.append(allocator, byte),
-        }
+    switch (parsed) {
+        .chat => |chat| {
+            try std.testing.expectEqualStrings("alice", chat.nick);
+            try std.testing.expectEqualStrings("hello", chat.text);
+        },
+        else => return error.UnexpectedMessageKind,
     }
-
-    return output.toOwnedSlice(allocator);
 }
 
-fn decodeChatText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var output: std.ArrayList(u8) = .empty;
-    errdefer output.deinit(allocator);
+test "parseMessage classifies commands" {
+    const parsed = nmdc.parseMessage("$Supports NoHello NoGetINFO|");
 
-    var index: usize = 0;
-    while (index < text.len) {
-        if (std.mem.startsWith(u8, text[index..], "&#124;")) {
-            try output.append(allocator, '|');
-            index += 6;
-            continue;
-        }
-        if (std.mem.startsWith(u8, text[index..], "&#36;")) {
-            try output.append(allocator, '$');
-            index += 5;
-            continue;
-        }
-        if (std.mem.startsWith(u8, text[index..], "&amp;")) {
-            try output.append(allocator, '&');
-            index += 5;
-            continue;
-        }
-        if (std.mem.startsWith(u8, text[index..], "/%DCN124%/")) {
-            try output.append(allocator, '|');
-            index += 10;
-            continue;
-        }
-        if (std.mem.startsWith(u8, text[index..], "/%DCN036%/")) {
-            try output.append(allocator, '$');
-            index += 10;
-            continue;
-        }
-
-        try output.append(allocator, text[index]);
-        index += 1;
+    switch (parsed) {
+        .command => |command| {
+            try std.testing.expectEqual(nmdc.CommandType.Supports, command.kind);
+            try std.testing.expectEqualStrings("NoHello NoGetINFO|", command.payload);
+        },
+        else => return error.UnexpectedMessageKind,
     }
+}
 
-    return output.toOwnedSlice(allocator);
+test "firstWord returns first token" {
+    try std.testing.expectEqualStrings("EXTENDEDPROTOCOLABC", nmdc.firstWord(" EXTENDEDPROTOCOLABC Pk=client ").?);
+    try std.testing.expect(nmdc.firstWord("   ") == null);
+}
+
+test "countNickListEntries ignores empty segments" {
+    try std.testing.expectEqual(@as(usize, 3), countNickListEntries("alice$$bob$$$$carol$$"));
+}
+
+test "escape and decode chat text roundtrip protocol escapes" {
+    const allocator = std.testing.allocator;
+
+    const escaped = try nmdc.escapeChatText(allocator, "hi & $ |\nthere");
+    defer allocator.free(escaped);
+    try std.testing.expectEqualStrings("hi &amp; &#36; &#124; there", escaped);
+
+    const decoded = try nmdc.decodeChatText(allocator, escaped);
+    defer allocator.free(decoded);
+    try std.testing.expectEqualStrings("hi & $ | there", decoded);
+}
+
+test "decodeChatText handles DCN escapes" {
+    const allocator = std.testing.allocator;
+
+    const decoded = try nmdc.decodeChatText(allocator, "a/%DCN036%/b/%DCN124%/c");
+    defer allocator.free(decoded);
+
+    try std.testing.expectEqualStrings("a$b|c", decoded);
 }

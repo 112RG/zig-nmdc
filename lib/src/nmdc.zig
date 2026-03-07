@@ -25,6 +25,17 @@ pub const NMDC = struct {
         payload: []const u8,
     };
 
+    pub const ChatLine = struct {
+        nick: []const u8,
+        text: []const u8,
+    };
+
+    pub const ParsedMessage = union(enum) {
+        chat: ChatLine,
+        command: ParsedCommand,
+        unknown: []const u8,
+    };
+
     pub fn getCommandType(msg: []const u8) CommandType {
         if (msg.len == 0 or msg[0] != '$') return .Unknown;
 
@@ -49,6 +60,38 @@ pub const NMDC = struct {
             .kind = kind,
             .payload = payload,
         };
+    }
+
+    pub fn parseMessage(msg: []const u8) ParsedMessage {
+        if (msg.len == 0) return .{ .unknown = msg };
+        if (parseChat(msg)) |chat| return .{ .chat = chat };
+        if (parseCommand(msg)) |command| return .{ .command = command };
+        return .{ .unknown = msg };
+    }
+
+    pub fn parseChat(msg: []const u8) ?ChatLine {
+        if (msg.len == 0 or msg[0] != '<') return null;
+
+        const end_nick = std.mem.indexOfScalar(u8, msg, '>') orelse return null;
+        if (end_nick <= 1) return null;
+
+        const text_start = if (msg.len > end_nick + 1 and msg[end_nick + 1] == ' ')
+            end_nick + 2
+        else
+            end_nick + 1;
+
+        return .{
+            .nick = msg[1..end_nick],
+            .text = if (text_start <= msg.len) msg[text_start..] else "",
+        };
+    }
+
+    pub fn firstWord(text: []const u8) ?[]const u8 {
+        const trimmed = std.mem.trim(u8, text, " ");
+        if (trimmed.len == 0) return null;
+
+        const end = std.mem.indexOfScalar(u8, trimmed, ' ') orelse trimmed.len;
+        return trimmed[0..end];
     }
 
     pub fn makeMyNick(allocator: std.mem.Allocator, nick: []const u8) ![]u8 {
@@ -78,6 +121,73 @@ pub const NMDC = struct {
             return lock_msg[start..end];
         }
         return null;
+    }
+
+    pub fn escapeChatText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        var output: std.ArrayList(u8) = .empty;
+        errdefer output.deinit(allocator);
+
+        for (text) |byte| {
+            switch (byte) {
+                '\n', '\r' => try output.append(allocator, ' '),
+                '&' => try output.appendSlice(allocator, "&amp;"),
+                '$' => try output.appendSlice(allocator, "&#36;"),
+                '|' => try output.appendSlice(allocator, "&#124;"),
+                else => try output.append(allocator, byte),
+            }
+        }
+
+        return output.toOwnedSlice(allocator);
+    }
+
+    pub fn decodeChatText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+        var output: std.ArrayList(u8) = .empty;
+        errdefer output.deinit(allocator);
+
+        var index: usize = 0;
+        while (index < text.len) {
+            if (std.mem.startsWith(u8, text[index..], "&#124;")) {
+                try output.append(allocator, '|');
+                index += 6;
+                continue;
+            }
+            if (std.mem.startsWith(u8, text[index..], "&#36;")) {
+                try output.append(allocator, '$');
+                index += 5;
+                continue;
+            }
+            if (std.mem.startsWith(u8, text[index..], "&amp;")) {
+                try output.append(allocator, '&');
+                index += 5;
+                continue;
+            }
+            if (std.mem.startsWith(u8, text[index..], "/%DCN124%/")) {
+                try output.append(allocator, '|');
+                index += 10;
+                continue;
+            }
+            if (std.mem.startsWith(u8, text[index..], "/%DCN036%/")) {
+                try output.append(allocator, '$');
+                index += 10;
+                continue;
+            }
+
+            try output.append(allocator, text[index]);
+            index += 1;
+        }
+
+        return output.toOwnedSlice(allocator);
+    }
+
+    pub fn formatChatMessage(
+        allocator: std.mem.Allocator,
+        nick: []const u8,
+        text: []const u8,
+    ) ![]u8 {
+        const escaped = try escapeChatText(allocator, text);
+        defer allocator.free(escaped);
+
+        return std.fmt.allocPrint(allocator, "<{s}> {s}|", .{ nick, escaped });
     }
 
     pub fn calculateKey(allocator: std.mem.Allocator, lock: []const u8) ![]u8 {
@@ -131,4 +241,34 @@ test "calculateKey simple" {
     defer allocator.free(key);
 
     try std.testing.expectEqualSlices(u8, expected, key);
+}
+
+test "parseMessage parses chat lines" {
+    const parsed = NMDC.parseMessage("<alice> hello");
+
+    switch (parsed) {
+        .chat => |chat| {
+            try std.testing.expectEqualStrings("alice", chat.nick);
+            try std.testing.expectEqualStrings("hello", chat.text);
+        },
+        else => return error.UnexpectedMessageKind,
+    }
+}
+
+test "formatChatMessage escapes reserved chat characters" {
+    const allocator = std.testing.allocator;
+
+    const formatted = try NMDC.formatChatMessage(allocator, "alice", "a & b | c $");
+    defer allocator.free(formatted);
+
+    try std.testing.expectEqualStrings("<alice> a &amp; b &#124; c &#36;|", formatted);
+}
+
+test "decodeChatText handles html and dcn escapes" {
+    const allocator = std.testing.allocator;
+
+    const decoded = try NMDC.decodeChatText(allocator, "&#36;/%DCN124%/&amp;");
+    defer allocator.free(decoded);
+
+    try std.testing.expectEqualStrings("$|&", decoded);
 }

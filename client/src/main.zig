@@ -376,3 +376,13 @@ fn tailSlice(text: []const u8, width: usize) []const u8 {
     if (text.len <= width) return text;
     return text[text.len - width ..];
 }
+
+test "truncateForWidth clips long lines" {
+    try std.testing.expectEqualStrings("hello", truncateForWidth("hello", 10));
+    try std.testing.expectEqualStrings("hel", truncateForWidth("hello", 3));
+}
+
+test "tailSlice keeps the rightmost characters" {
+    try std.testing.expectEqualStrings("hello", tailSlice("hello", 10));
+    try std.testing.expectEqualStrings("llo", tailSlice("hello", 3));
+}
