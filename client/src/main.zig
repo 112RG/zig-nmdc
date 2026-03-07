@@ -38,6 +38,20 @@ const AppLogLevel = enum {
     debug,
 };
 
+const ViewTab = enum {
+    logs,
+    chat,
+    pms,
+
+    fn next(self: ViewTab) ViewTab {
+        return switch (self) {
+            .logs => .chat,
+            .chat => .pms,
+            .pms => .logs,
+        };
+    }
+};
+
 const NickList = struct {
     allocator: std.mem.Allocator,
     items: std.ArrayList([]u8) = .empty,
@@ -174,9 +188,11 @@ const App = struct {
     mutex: std.Thread.Mutex = .{},
     app_logs: LogBuffer,
     chat_logs: LogBuffer,
+    pm_logs: LogBuffer,
     op_nicks: NickList,
     bot_nicks: NickList,
     input: std.ArrayList(u8) = .empty,
+    active_tab: ViewTab = .chat,
     should_exit: bool = false,
     connected: bool = false,
 
@@ -184,6 +200,7 @@ const App = struct {
         self.input.deinit(self.allocator);
         self.bot_nicks.deinit();
         self.op_nicks.deinit();
+        self.pm_logs.deinit();
         self.chat_logs.deinit();
         self.app_logs.deinit();
         self.hub.deinit();
@@ -217,18 +234,29 @@ const App = struct {
         try self.chat_logs.appendOwned(line);
     }
 
+    fn addPrivateMessageLogLocked(self: *App, nick: []const u8, text: []const u8) !void {
+        const line = try formatPrivateMessageLine(
+            self.allocator,
+            self.hub.nick,
+            &self.op_nicks,
+            &self.bot_nicks,
+            nick,
+            text,
+        );
+        try self.pm_logs.appendOwned(line);
+    }
+
     fn renderLocked(self: *App) !void {
         const stdout = std.fs.File.stdout().deprecatedWriter();
         const screen = Terminal.size();
         const width: usize = @max(@as(usize, screen.cols), 20);
         const height: usize = @max(@as(usize, screen.rows), 10);
 
-        const separator_row = height / 2;
-        const chat_header_row = separator_row + 1;
+        const tabs_row: usize = 2;
+        const content_header_row: usize = 3;
+        const content_start_row: usize = 4;
         const input_row = height;
-        const log_body_rows = if (separator_row > 2) separator_row - 2 else 0;
-        const chat_body_start = chat_header_row + 1;
-        const chat_body_rows = if (input_row > chat_body_start) input_row - chat_body_start else 0;
+        const content_rows = if (input_row > content_start_row) input_row - content_start_row else 0;
 
         const header = try std.fmt.allocPrint(
             self.allocator,
@@ -237,13 +265,14 @@ const App = struct {
         );
         defer self.allocator.free(header);
 
+        const tab_bar = try self.formatTabBar();
+        defer self.allocator.free(tab_bar);
+
         try stdout.writeAll("\x1b[H\x1b[2J");
         try writeAt(stdout, 1, width, header);
-        try writeAt(stdout, 2, width, ansi_bold_white ++ "App logs" ++ ansi_reset);
-        try renderLines(stdout, 3, log_body_rows, width, self.app_logs.lines.items);
-        try writeSeparator(stdout, separator_row, width);
-        try writeAt(stdout, chat_header_row, width, ansi_bold_white ++ "Chat" ++ ansi_reset);
-        try renderLines(stdout, chat_body_start, chat_body_rows, width, self.chat_logs.lines.items);
+        try writeAt(stdout, tabs_row, width, tab_bar);
+        try writeAt(stdout, content_header_row, width, activeTabHeader(self.active_tab));
+        try renderLines(stdout, content_start_row, content_rows, width, self.activeLines());
 
         const prompt_text = try std.fmt.allocPrint(
             self.allocator,
@@ -258,6 +287,27 @@ const App = struct {
         try stdout.print("\x1b[{d};{d}H", .{ input_row, cursor_col });
     }
 
+    fn activeLines(self: *App) []const []u8 {
+        return switch (self.active_tab) {
+            .logs => self.app_logs.lines.items,
+            .chat => self.chat_logs.lines.items,
+            .pms => self.pm_logs.lines.items,
+        };
+    }
+
+    fn formatTabBar(self: *App) ![]u8 {
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{s}  {s}  {s}  {s}",
+            .{
+                formatTabLabel(self.active_tab == .logs, "Logs"),
+                formatTabLabel(self.active_tab == .chat, "Chat"),
+                formatTabLabel(self.active_tab == .pms, "PMs"),
+                ansi_dim ++ "Tab switches view" ++ ansi_reset,
+            },
+        );
+    }
+
     fn handleEvent(self: *App, event: *hub_mod.Event) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -265,17 +315,7 @@ const App = struct {
         switch (event.*) {
             .log => |line| try self.addAppLogLocked(.info, "hub", "{s}", .{line}),
             .chat => |chat| try self.addChatLogLocked(chat.nick, chat.text),
-            .private_message => |message| {
-                const line = try formatPrivateMessageLine(
-                    self.allocator,
-                    self.hub.nick,
-                    &self.op_nicks,
-                    &self.bot_nicks,
-                    message.from,
-                    message.text,
-                );
-                try self.chat_logs.appendOwned(line);
-            },
+            .private_message => |message| try self.addPrivateMessageLogLocked(message.from, message.text),
             .op_list => |payload| {
                 const count = try self.op_nicks.replaceFromPayload(payload);
                 try self.addAppLogLocked(.info, "hub", "Updated op list ({d})", .{count});
@@ -327,6 +367,7 @@ pub fn main() !void {
         .terminal = terminal,
         .app_logs = .{ .allocator = allocator, .capacity = max_log_lines },
         .chat_logs = .{ .allocator = allocator, .capacity = max_log_lines },
+        .pm_logs = .{ .allocator = allocator, .capacity = max_log_lines },
         .op_nicks = .{ .allocator = allocator },
         .bot_nicks = .{ .allocator = allocator },
     };
@@ -335,7 +376,8 @@ pub fn main() !void {
     app.mutex.lock();
     try app.addAppLogLocked(.info, "client", "Starting client for {s}:{d} as {s}", .{ app.host, app.port, app.hub.nick });
     try app.addAppLogLocked(.info, "network", "Connecting to {s}:{d}", .{ app.host, app.port });
-    try app.addAppLogLocked(.info, "ui", "Type messages and press Enter. Press Ctrl+C to exit.", .{});
+    try app.addAppLogLocked(.info, "ui", "Type messages and press Enter. Use /msg <nick> <text> for PMs.", .{});
+    try app.addAppLogLocked(.info, "ui", "Press Tab to switch between Logs, Chat, and PMs. Press Ctrl+C to exit.", .{});
     try app.renderLocked();
     app.mutex.unlock();
 
@@ -376,6 +418,12 @@ fn handleInputByte(app: *App, byte: u8) !bool {
             app.requestExit();
             return false;
         },
+        9 => {
+            app.mutex.lock();
+            app.active_tab = app.active_tab.next();
+            try app.renderLocked();
+            app.mutex.unlock();
+        },
         '\r', '\n' => {
             var maybe_message: ?[]u8 = null;
 
@@ -414,7 +462,7 @@ fn handleInputByte(app: *App, byte: u8) !bool {
 }
 
 fn dispatchInputMessage(app: *App, message: []const u8) !void {
-    switch (parseInput(message)) {
+    switch (parseInput(app.active_tab, message)) {
         .chat => |text| {
             if (text.len == 0) return;
 
@@ -442,10 +490,15 @@ fn dispatchInputMessage(app: *App, message: []const u8) !void {
     }
 }
 
-fn parseInput(message: []const u8) ParsedInput {
+fn parseInput(active_tab: ViewTab, message: []const u8) ParsedInput {
     const trimmed = std.mem.trim(u8, message, " ");
     if (trimmed.len == 0) return .{ .chat = "" };
-    if (!std.mem.startsWith(u8, trimmed, "/")) return .{ .chat = trimmed };
+    if (!std.mem.startsWith(u8, trimmed, "/")) {
+        if (active_tab == .pms) {
+            return .{ .invalid = "Use /msg <nick> <message> in the PM tab" };
+        }
+        return .{ .chat = trimmed };
+    }
 
     if (std.mem.startsWith(u8, trimmed, "/msg")) {
         const rest = std.mem.trimLeft(u8, trimmed[4..], " ");
@@ -562,6 +615,21 @@ fn writeStyledWidth(writer: anytype, text: []const u8, width: usize) !void {
 fn tailSlice(text: []const u8, width: usize) []const u8 {
     if (text.len <= width) return text;
     return text[text.len - width ..];
+}
+
+fn activeTabHeader(tab: ViewTab) []const u8 {
+    return switch (tab) {
+        .logs => ansi_bold_white ++ "Logs" ++ ansi_reset,
+        .chat => ansi_bold_white ++ "Chat" ++ ansi_reset,
+        .pms => ansi_bold_white ++ "Private messages" ++ ansi_reset,
+    };
+}
+
+fn formatTabLabel(is_active: bool, comptime label: []const u8) []const u8 {
+    return if (is_active)
+        ansi_bold_green ++ "[" ++ label ++ "]" ++ ansi_reset
+    else
+        ansi_dim ++ label ++ ansi_reset;
 }
 
 fn formatAppLogLine(
@@ -709,8 +777,14 @@ test "tailSlice keeps the rightmost characters" {
     try std.testing.expectEqualStrings("llo", tailSlice("hello", 3));
 }
 
+test "view tab cycles in order" {
+    try std.testing.expectEqual(ViewTab.chat, ViewTab.logs.next());
+    try std.testing.expectEqual(ViewTab.pms, ViewTab.chat.next());
+    try std.testing.expectEqual(ViewTab.logs, ViewTab.pms.next());
+}
+
 test "parseInput parses private message command" {
-    const parsed = parseInput("/msg alice hello there");
+    const parsed = parseInput(.chat, "/msg alice hello there");
 
     switch (parsed) {
         .private_message => |message| {
@@ -722,10 +796,28 @@ test "parseInput parses private message command" {
 }
 
 test "parseInput rejects malformed msg command" {
-    const parsed = parseInput("/msg alice");
+    const parsed = parseInput(.chat, "/msg alice");
 
     switch (parsed) {
         .invalid => |reason| try std.testing.expectEqualStrings("Usage: /msg <nick> <message>", reason),
         else => return error.ExpectedInvalidInput,
+    }
+}
+
+test "parseInput blocks plain text in PM tab" {
+    const parsed = parseInput(.pms, "hello everyone");
+
+    switch (parsed) {
+        .invalid => |reason| try std.testing.expectEqualStrings("Use /msg <nick> <message> in the PM tab", reason),
+        else => return error.ExpectedInvalidInput,
+    }
+}
+
+test "parseInput still allows plain text in chat tab" {
+    const parsed = parseInput(.chat, "hello everyone");
+
+    switch (parsed) {
+        .chat => |text| try std.testing.expectEqualStrings("hello everyone", text),
+        else => return error.UnexpectedInputKind,
     }
 }
