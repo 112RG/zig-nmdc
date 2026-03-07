@@ -1,1 +1,0 @@
-cd client && zig build run
