@@ -7,8 +7,6 @@ pub const std_options: std.Options = .{
     .logFn = logger.logFn,
 };
 
-const log = std.log.scoped(.client);
-
 const c = @cImport({
     @cInclude("termios.h");
     @cInclude("unistd.h");
@@ -19,6 +17,64 @@ const default_host = "10.0.1.141";
 const default_port: u16 = 411;
 const default_nick = "TestBot";
 const max_log_lines: usize = 256;
+
+const ansi_reset = "\x1b[0m";
+const ansi_dim = "\x1b[90m";
+const ansi_red = "\x1b[31m";
+const ansi_yellow = "\x1b[33m";
+const ansi_green = "\x1b[32m";
+const ansi_cyan = "\x1b[36m";
+const ansi_blue = "\x1b[34m";
+const ansi_magenta = "\x1b[35m";
+const ansi_bold_green = "\x1b[1;32m";
+const ansi_bold_red = "\x1b[1;31m";
+const ansi_bold_magenta = "\x1b[1;35m";
+const ansi_bold_white = "\x1b[1;37m";
+
+const AppLogLevel = enum {
+    err,
+    warn,
+    info,
+    debug,
+};
+
+const NickList = struct {
+    allocator: std.mem.Allocator,
+    items: std.ArrayList([]u8) = .empty,
+
+    fn deinit(self: *NickList) void {
+        self.clear();
+        self.items.deinit(self.allocator);
+    }
+
+    fn clear(self: *NickList) void {
+        for (self.items.items) |item| {
+            self.allocator.free(item);
+        }
+        self.items.clearRetainingCapacity();
+    }
+
+    fn contains(self: *const NickList, nick: []const u8) bool {
+        for (self.items.items) |item| {
+            if (std.mem.eql(u8, item, nick)) return true;
+        }
+        return false;
+    }
+
+    fn replaceFromPayload(self: *NickList, payload: []const u8) !usize {
+        self.clear();
+
+        var count: usize = 0;
+        var iterator = std.mem.splitSequence(u8, payload, "$$");
+        while (iterator.next()) |entry| {
+            if (entry.len == 0) continue;
+            try self.items.append(self.allocator, try self.allocator.dupe(u8, entry));
+            count += 1;
+        }
+
+        return count;
+    }
+};
 
 const Config = struct {
     host: []u8,
@@ -109,12 +165,16 @@ const App = struct {
     mutex: std.Thread.Mutex = .{},
     app_logs: LogBuffer,
     chat_logs: LogBuffer,
+    op_nicks: NickList,
+    bot_nicks: NickList,
     input: std.ArrayList(u8) = .empty,
     should_exit: bool = false,
     connected: bool = false,
 
     fn deinit(self: *App) void {
         self.input.deinit(self.allocator);
+        self.bot_nicks.deinit();
+        self.op_nicks.deinit();
         self.chat_logs.deinit();
         self.app_logs.deinit();
         self.hub.deinit();
@@ -122,12 +182,30 @@ const App = struct {
         self.allocator.free(self.host);
     }
 
-    fn addAppLogLocked(self: *App, comptime format: []const u8, args: anytype) !void {
-        try self.app_logs.appendFmt(format, args);
+    fn addAppLogLocked(
+        self: *App,
+        level: AppLogLevel,
+        scope: []const u8,
+        comptime format: []const u8,
+        args: anytype,
+    ) !void {
+        const message = try std.fmt.allocPrint(self.allocator, format, args);
+        defer self.allocator.free(message);
+
+        const line = try formatAppLogLine(self.allocator, level, scope, message);
+        try self.app_logs.appendOwned(line);
     }
 
     fn addChatLogLocked(self: *App, nick: []const u8, text: []const u8) !void {
-        try self.chat_logs.appendFmt("<{s}> {s}", .{ nick, text });
+        const line = try formatChatLine(
+            self.allocator,
+            self.hub.nick,
+            &self.op_nicks,
+            &self.bot_nicks,
+            nick,
+            text,
+        );
+        try self.chat_logs.appendOwned(line);
     }
 
     fn renderLocked(self: *App) !void {
@@ -152,10 +230,10 @@ const App = struct {
 
         try stdout.writeAll("\x1b[H\x1b[2J");
         try writeAt(stdout, 1, width, header);
-        try writeAt(stdout, 2, width, "App logs");
+        try writeAt(stdout, 2, width, ansi_bold_white ++ "App logs" ++ ansi_reset);
         try renderLines(stdout, 3, log_body_rows, width, self.app_logs.lines.items);
         try writeSeparator(stdout, separator_row, width);
-        try writeAt(stdout, chat_header_row, width, "Chat");
+        try writeAt(stdout, chat_header_row, width, ansi_bold_white ++ "Chat" ++ ansi_reset);
         try renderLines(stdout, chat_body_start, chat_body_rows, width, self.chat_logs.lines.items);
 
         const prompt_text = try std.fmt.allocPrint(
@@ -176,8 +254,16 @@ const App = struct {
         defer self.mutex.unlock();
 
         switch (event.*) {
-            .log => |line| try self.addAppLogLocked("{s}", .{line}),
+            .log => |line| try self.addAppLogLocked(.info, "hub", "{s}", .{line}),
             .chat => |chat| try self.addChatLogLocked(chat.nick, chat.text),
+            .op_list => |payload| {
+                const count = try self.op_nicks.replaceFromPayload(payload);
+                try self.addAppLogLocked(.info, "hub", "Updated op list ({d})", .{count});
+            },
+            .bot_list => |payload| {
+                const count = try self.bot_nicks.replaceFromPayload(payload);
+                try self.addAppLogLocked(.info, "hub", "Updated bot list ({d})", .{count});
+            },
             .connected => self.connected = true,
         }
 
@@ -208,8 +294,6 @@ pub fn main() !void {
     var config = try parseConfig(allocator);
     defer config.deinit(allocator);
 
-    log.info("starting client for {s}:{d} as {s}", .{ config.host, config.port, config.nick });
-
     const address = try std.net.Address.parseIp4(config.host, config.port);
 
     var terminal = try Terminal.init();
@@ -223,12 +307,15 @@ pub fn main() !void {
         .terminal = terminal,
         .app_logs = .{ .allocator = allocator, .capacity = max_log_lines },
         .chat_logs = .{ .allocator = allocator, .capacity = max_log_lines },
+        .op_nicks = .{ .allocator = allocator },
+        .bot_nicks = .{ .allocator = allocator },
     };
     defer app.deinit();
 
     app.mutex.lock();
-    try app.addAppLogLocked("Connecting to {s}:{d}", .{ app.host, app.port });
-    try app.addAppLogLocked("Type messages and press Enter. Press Ctrl+C to exit.", .{});
+    try app.addAppLogLocked(.info, "client", "Starting client for {s}:{d} as {s}", .{ app.host, app.port, app.hub.nick });
+    try app.addAppLogLocked(.info, "network", "Connecting to {s}:{d}", .{ app.host, app.port });
+    try app.addAppLogLocked(.info, "ui", "Type messages and press Enter. Press Ctrl+C to exit.", .{});
     try app.renderLocked();
     app.mutex.unlock();
 
@@ -283,10 +370,9 @@ fn handleInputByte(app: *App, byte: u8) !bool {
             if (maybe_message) |message| {
                 defer app.allocator.free(message);
                 app.hub.sendChat(message) catch |err| {
-                    log.err("failed to send chat message: {}", .{err});
                     app.mutex.lock();
                     defer app.mutex.unlock();
-                    try app.addAppLogLocked("Chat send failed: {}", .{err});
+                    try app.addAppLogLocked(.err, "chat", "Chat send failed: {}", .{err});
                     try app.renderLocked();
                 };
             }
@@ -323,21 +409,19 @@ fn networkThreadMain(app: *App) void {
         events.clearRetainingCapacity();
 
         const bytes_read = app.hub.readEvents(&events) catch |err| {
-            log.err("network thread exiting with error: {}", .{err});
             app.mutex.lock();
             defer app.mutex.unlock();
             app.should_exit = true;
-            app.addAppLogLocked("Network error: {}", .{err}) catch {};
+            app.addAppLogLocked(.err, "network", "Network error: {}", .{err}) catch {};
             app.renderLocked() catch {};
             return;
         };
 
         if (bytes_read == 0) {
-            log.info("hub connection closed", .{});
             app.mutex.lock();
             defer app.mutex.unlock();
             app.should_exit = true;
-            app.addAppLogLocked("Connection closed by hub", .{}) catch {};
+            app.addAppLogLocked(.warn, "network", "Connection closed by hub", .{}) catch {};
             app.renderLocked() catch {};
             return;
         }
@@ -371,18 +455,34 @@ fn writeSeparator(writer: anytype, row: usize, width: usize) !void {
     for (0..width) |_| {
         try writer.writeByte('-');
     }
-    try writer.writeAll("\x1b[K");
+    try writer.writeAll(ansi_reset ++ "\x1b[K");
 }
 
 fn writeAt(writer: anytype, row: usize, width: usize, text: []const u8) !void {
     try writer.print("\x1b[{d};1H", .{row});
-    try writer.writeAll(truncateForWidth(text, width));
-    try writer.writeAll("\x1b[K");
+    try writeStyledWidth(writer, text, width);
+    try writer.writeAll(ansi_reset ++ "\x1b[K");
 }
 
-fn truncateForWidth(text: []const u8, width: usize) []const u8 {
-    if (text.len <= width) return text;
-    return text[0..width];
+fn writeStyledWidth(writer: anytype, text: []const u8, width: usize) !void {
+    if (width == 0) return;
+
+    var visible: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == '\x1b' and index + 1 < text.len and text[index + 1] == '[') {
+            const end = std.mem.indexOfScalarPos(u8, text, index, 'm') orelse break;
+            try writer.writeAll(text[index .. end + 1]);
+            index = end + 1;
+            continue;
+        }
+
+        if (visible >= width) break;
+
+        try writer.writeByte(text[index]);
+        visible += 1;
+        index += 1;
+    }
 }
 
 fn tailSlice(text: []const u8, width: usize) []const u8 {
@@ -390,9 +490,105 @@ fn tailSlice(text: []const u8, width: usize) []const u8 {
     return text[text.len - width ..];
 }
 
+fn formatAppLogLine(
+    allocator: std.mem.Allocator,
+    level: AppLogLevel,
+    scope: []const u8,
+    message: []const u8,
+) ![]u8 {
+    const timestamp = try makeTimestamp(allocator);
+    defer allocator.free(timestamp);
+
+    const level_label = switch (level) {
+        .err => "ERROR",
+        .warn => "WARN ",
+        .info => "INFO ",
+        .debug => "DEBUG",
+    };
+    const level_color = switch (level) {
+        .err => ansi_bold_red,
+        .warn => ansi_yellow,
+        .info => ansi_green,
+        .debug => ansi_cyan,
+    };
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}[{s}]{s} {s}[{s}]{s} {s}({s}){s} {s}",
+        .{ ansi_dim, timestamp, ansi_reset, level_color, level_label, ansi_reset, ansi_blue, scope, ansi_reset, message },
+    );
+}
+
+fn formatChatLine(
+    allocator: std.mem.Allocator,
+    my_nick: []const u8,
+    op_nicks: *const NickList,
+    bot_nicks: *const NickList,
+    nick: []const u8,
+    text: []const u8,
+) ![]u8 {
+    const timestamp = try makeTimestamp(allocator);
+    defer allocator.free(timestamp);
+
+    const nick_color = if (std.mem.eql(u8, nick, my_nick))
+        ansi_bold_green
+    else if (op_nicks.contains(nick))
+        ansi_bold_red
+    else if (bot_nicks.contains(nick))
+        ansi_bold_magenta
+    else
+        ansi_cyan;
+
+    const role_tag = if (std.mem.eql(u8, nick, my_nick))
+        " " ++ ansi_green ++ "[me]" ++ ansi_reset
+    else if (op_nicks.contains(nick))
+        " " ++ ansi_red ++ "[op]" ++ ansi_reset
+    else if (bot_nicks.contains(nick))
+        " " ++ ansi_magenta ++ "[bot]" ++ ansi_reset
+    else
+        "";
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}[{s}]{s} {s}<{s}>{s}{s} {s}",
+        .{ ansi_dim, timestamp, ansi_reset, nick_color, nick, ansi_reset, role_tag, text },
+    );
+}
+
+fn makeTimestamp(allocator: std.mem.Allocator) ![]u8 {
+    const now = std.time.timestamp();
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @as(u64, @intCast(@max(now, 0))) };
+    const day_seconds = epoch_seconds.getDaySeconds();
+
+    return std.fmt.allocPrint(
+        allocator,
+        "{d:0>2}:{d:0>2}:{d:0>2}",
+        .{
+            day_seconds.getHoursIntoDay(),
+            day_seconds.getMinutesIntoHour(),
+            day_seconds.getSecondsIntoMinute(),
+        },
+    );
+}
+
 test "truncateForWidth clips long lines" {
-    try std.testing.expectEqualStrings("hello", truncateForWidth("hello", 10));
-    try std.testing.expectEqualStrings("hel", truncateForWidth("hello", 3));
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+
+    try writeStyledWidth(list.writer(std.testing.allocator), "hello", 10);
+    try std.testing.expectEqualStrings("hello", list.items);
+
+    list.clearRetainingCapacity();
+    try writeStyledWidth(list.writer(std.testing.allocator), "hello", 3);
+    try std.testing.expectEqualStrings("hel", list.items);
+}
+
+test "writeStyledWidth ignores ansi escape length" {
+    var list: std.ArrayList(u8) = .empty;
+    defer list.deinit(std.testing.allocator);
+
+    try writeStyledWidth(list.writer(std.testing.allocator), ansi_red ++ "hello" ++ ansi_reset, 3);
+    try std.testing.expectEqualStrings(ansi_red ++ "hel", list.items);
 }
 
 test "tailSlice keeps the rightmost characters" {

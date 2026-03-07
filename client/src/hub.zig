@@ -10,12 +10,16 @@ pub const ChatMessage = struct {
 pub const Event = union(enum) {
     log: []u8,
     chat: ChatMessage,
+    op_list: []u8,
+    bot_list: []u8,
     connected,
 };
 
 pub fn deinitEvent(allocator: std.mem.Allocator, event: *Event) void {
     switch (event.*) {
         .log => |line| allocator.free(line),
+        .op_list => |payload| allocator.free(payload),
+        .bot_list => |payload| allocator.free(payload),
         .chat => |chat| {
             allocator.free(chat.nick);
             allocator.free(chat.text);
@@ -115,7 +119,9 @@ pub const DccHub = struct {
                 .{countNickListEntries(command.payload)},
             ),
             .Quit => try appendLog(events, self.allocator, "User left: {s}", .{command.payload}),
-            .MyINFO, .OpList, .BotList, .LogedIn => {},
+            .OpList => try events.append(self.allocator, .{ .op_list = try self.allocator.dupe(u8, command.payload) }),
+            .BotList => try events.append(self.allocator, .{ .bot_list = try self.allocator.dupe(u8, command.payload) }),
+            .MyINFO, .LogedIn => {},
             .Unknown,
             .Key,
             .ValidateNick,
