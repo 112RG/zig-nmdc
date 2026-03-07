@@ -36,6 +36,7 @@ pub const DccHub = struct {
     nick: []u8,
     read_buffer: std.ArrayList(u8),
     hello_seen: bool = false,
+    closed: bool = false,
 
     pub fn connect(
         allocator: std.mem.Allocator,
@@ -51,12 +52,16 @@ pub const DccHub = struct {
     }
 
     pub fn deinit(self: *DccHub) void {
-        self.connection.close();
+        self.close();
         self.allocator.free(self.nick);
         self.read_buffer.deinit(self.allocator);
     }
 
     pub fn close(self: *DccHub) void {
+        if (self.closed) return;
+        self.closed = true;
+
+        std.posix.shutdown(self.connection.handle, .both) catch {};
         self.connection.close();
     }
 
