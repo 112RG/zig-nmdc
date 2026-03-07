@@ -1,6 +1,19 @@
 # NMDC Library
 
-This Zig package implements the NMDC protocol logic for reuse in server and client applications.
+Shared NMDC protocol library for the client and server packages.
 
-- Place protocol code in `src/`
-- Export public APIs via `src/main.zig` or additional modules
+## Includes
+
+- message framing helpers
+- command and chat parsing
+- `$Lock` key calculation
+- public chat escaping/decoding
+- private message parsing/building
+- `$MyINFO` parsing/building
+- common NMDC message builders for hub/client traffic
+
+## Test
+
+```bash
+zig build test
+```
