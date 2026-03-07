@@ -5,6 +5,7 @@ on:
     branches: ["main", "master"]
   pull_request:
     branches: ["main", "master"]
+  workflow_dispatch:
 
 jobs:
   lint:
@@ -15,8 +16,13 @@ jobs:
       - uses: goto-bus-stop/setup-zig@v2
         with:
           version: 0.15.2
+
       - name: Check Format
-        run: zig fmt --check .
+        run: |
+          find lib client server \
+            -type f \
+            \( -name '*.zig' -o -name 'build.zig' \) \
+            -print0 | xargs -0 zig fmt --check
 
   build-and-test:
     name: Test ${{ matrix.project }}
@@ -25,16 +31,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        project: [lib, server, client]
+        include:
+          - project: lib
+            path: lib
+          - project: server
+            path: server
+          - project: client
+            path: client
+    defaults:
+      run:
+        working-directory: ${{ matrix.path }}
     steps:
       - uses: actions/checkout@v4
-      
+
       - uses: goto-bus-stop/setup-zig@v2
         with:
           version: 0.15.2
 
-      - name: Build
-        run: cd ${{ matrix.project }} && zig build
-
       - name: Test
-        run: cd ${{ matrix.project }} && zig build test
+        run: zig build test
+
+      - name: Build
+        run: zig build
