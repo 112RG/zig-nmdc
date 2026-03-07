@@ -6,7 +6,7 @@ pub fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    const stderr = std.io.getStdErr().writer();
+    const stderr = std.fs.File.stderr().deprecatedWriter();
     std.debug.lockStdErr();
     defer std.debug.unlockStdErr();
 

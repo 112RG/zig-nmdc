@@ -1,5 +1,13 @@
 const std = @import("std");
 const hub_mod = @import("hub.zig");
+const logger = @import("logger");
+
+pub const std_options: std.Options = .{
+    .log_level = .info,
+    .logFn = logger.logFn,
+};
+
+const log = std.log.scoped(.client);
 
 const c = @cImport({
     @cInclude("termios.h");
@@ -200,6 +208,8 @@ pub fn main() !void {
     var config = try parseConfig(allocator);
     defer config.deinit(allocator);
 
+    log.info("starting client for {s}:{d} as {s}", .{ config.host, config.port, config.nick });
+
     const address = try std.net.Address.parseIp4(config.host, config.port);
 
     var terminal = try Terminal.init();
@@ -273,6 +283,7 @@ fn handleInputByte(app: *App, byte: u8) !bool {
             if (maybe_message) |message| {
                 defer app.allocator.free(message);
                 app.hub.sendChat(message) catch |err| {
+                    log.err("failed to send chat message: {}", .{err});
                     app.mutex.lock();
                     defer app.mutex.unlock();
                     try app.addAppLogLocked("Chat send failed: {}", .{err});
@@ -312,6 +323,7 @@ fn networkThreadMain(app: *App) void {
         events.clearRetainingCapacity();
 
         const bytes_read = app.hub.readEvents(&events) catch |err| {
+            log.err("network thread exiting with error: {}", .{err});
             app.mutex.lock();
             defer app.mutex.unlock();
             app.should_exit = true;
@@ -321,6 +333,7 @@ fn networkThreadMain(app: *App) void {
         };
 
         if (bytes_read == 0) {
+            log.info("hub connection closed", .{});
             app.mutex.lock();
             defer app.mutex.unlock();
             app.should_exit = true;
