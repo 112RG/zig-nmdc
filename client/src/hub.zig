@@ -32,7 +32,7 @@ pub const DccHub = struct {
     allocator: std.mem.Allocator,
     connection: std.net.Stream,
     nick: []u8,
-    read_buffer: std.ArrayList(u8),
+    read_buffer: nmdc.MessageBuffer,
     hello_seen: bool = false,
     closed: bool = false,
 
@@ -45,7 +45,7 @@ pub const DccHub = struct {
             .allocator = allocator,
             .connection = try net.tcpConnectToAddress(address),
             .nick = try allocator.dupe(u8, nick),
-            .read_buffer = .empty,
+            .read_buffer = .{},
         };
     }
 
@@ -68,7 +68,7 @@ pub const DccHub = struct {
         const bytes_read = try self.connection.read(buffer[0..]);
         if (bytes_read == 0) return 0;
 
-        try self.read_buffer.appendSlice(self.allocator, buffer[0..bytes_read]);
+        try self.read_buffer.append(self.allocator, buffer[0..bytes_read]);
         try self.drainMessages(events);
         return bytes_read;
     }
@@ -81,21 +81,12 @@ pub const DccHub = struct {
     }
 
     fn drainMessages(self: *DccHub, events: *std.ArrayList(Event)) !void {
-        var start: usize = 0;
-
-        while (std.mem.indexOfScalarPos(u8, self.read_buffer.items, start, '|')) |end| {
-            const raw = std.mem.trim(u8, self.read_buffer.items[start..end], "\r\n");
+        while (self.read_buffer.next()) |raw| {
             if (raw.len != 0) {
                 try self.handleMessage(raw, events);
             }
-            start = end + 1;
         }
-
-        if (start == 0) return;
-
-        const remaining = self.read_buffer.items.len - start;
-        std.mem.copyForwards(u8, self.read_buffer.items[0..remaining], self.read_buffer.items[start..]);
-        self.read_buffer.items.len = remaining;
+        self.read_buffer.compact();
     }
 
     fn handleMessage(self: *DccHub, message: []const u8, events: *std.ArrayList(Event)) !void {
@@ -116,7 +107,7 @@ pub const DccHub = struct {
                 events,
                 self.allocator,
                 "Received nick list ({d} users)",
-                .{countNickListEntries(command.payload)},
+                .{nmdc.countNickListEntries(command.payload)},
             ),
             .Quit => try appendLog(events, self.allocator, "User left: {s}", .{command.payload}),
             .OpList => try events.append(self.allocator, .{ .op_list = try self.allocator.dupe(u8, command.payload) }),
@@ -192,17 +183,6 @@ fn appendLog(
     try events.append(allocator, .{ .log = try std.fmt.allocPrint(allocator, format, args) });
 }
 
-fn countNickListEntries(payload: []const u8) usize {
-    if (payload.len == 0) return 0;
-
-    var count: usize = 0;
-    var it = std.mem.splitSequence(u8, payload, "$$");
-    while (it.next()) |entry| {
-        if (entry.len != 0) count += 1;
-    }
-    return count;
-}
-
 test "parseMessage classifies chat lines" {
     const parsed = nmdc.parseMessage("<alice> hello");
 
@@ -233,7 +213,7 @@ test "firstWord returns first token" {
 }
 
 test "countNickListEntries ignores empty segments" {
-    try std.testing.expectEqual(@as(usize, 3), countNickListEntries("alice$$bob$$$$carol$$"));
+    try std.testing.expectEqual(@as(usize, 3), nmdc.countNickListEntries("alice$$bob$$$$carol$$"));
 }
 
 test "escape and decode chat text roundtrip protocol escapes" {

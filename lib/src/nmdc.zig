@@ -2,6 +2,35 @@
 const std = @import("std");
 
 pub const NMDC = struct {
+    pub const MessageBuffer = struct {
+        bytes: std.ArrayList(u8) = .empty,
+        cursor: usize = 0,
+
+        pub fn deinit(self: *MessageBuffer, allocator: std.mem.Allocator) void {
+            self.bytes.deinit(allocator);
+        }
+
+        pub fn append(self: *MessageBuffer, allocator: std.mem.Allocator, data: []const u8) !void {
+            try self.bytes.appendSlice(allocator, data);
+        }
+
+        pub fn next(self: *MessageBuffer) ?[]const u8 {
+            const end = std.mem.indexOfScalarPos(u8, self.bytes.items, self.cursor, '|') orelse return null;
+            const message = std.mem.trim(u8, self.bytes.items[self.cursor..end], "\r\n");
+            self.cursor = end + 1;
+            return message;
+        }
+
+        pub fn compact(self: *MessageBuffer) void {
+            if (self.cursor == 0) return;
+
+            const remaining = self.bytes.items.len - self.cursor;
+            std.mem.copyForwards(u8, self.bytes.items[0..remaining], self.bytes.items[self.cursor..]);
+            self.bytes.items.len = remaining;
+            self.cursor = 0;
+        }
+    };
+
     pub const CommandType = enum {
         Supports,
         Hello,
@@ -94,6 +123,17 @@ pub const NMDC = struct {
         return trimmed[0..end];
     }
 
+    pub fn countNickListEntries(payload: []const u8) usize {
+        if (payload.len == 0) return 0;
+
+        var count: usize = 0;
+        var iterator = std.mem.splitSequence(u8, payload, "$$");
+        while (iterator.next()) |entry| {
+            if (entry.len != 0) count += 1;
+        }
+        return count;
+    }
+
     pub fn makeMyNick(allocator: std.mem.Allocator, nick: []const u8) ![]u8 {
         // Compose $MyNick <nick>|\n
         const buf = try std.fmt.allocPrint(allocator, "$MyNick {s}|\n", .{nick});
@@ -107,6 +147,10 @@ pub const NMDC = struct {
             return hello_msg[nick_start..];
         }
         return null;
+    }
+
+    pub fn makeHello(allocator: std.mem.Allocator, nick: []const u8) ![]u8 {
+        return std.fmt.allocPrint(allocator, "$Hello {s}|", .{nick});
     }
 
     pub fn parseLock(lock_msg: []const u8) ?[]const u8 {
@@ -271,4 +315,31 @@ test "decodeChatText handles html and dcn escapes" {
     defer allocator.free(decoded);
 
     try std.testing.expectEqualStrings("$|&", decoded);
+}
+
+test "message buffer yields complete pipe-delimited messages" {
+    var buffer = NMDC.MessageBuffer{};
+    defer buffer.deinit(std.testing.allocator);
+
+    try buffer.append(std.testing.allocator, "$Lock abc|<nick> hi|");
+
+    try std.testing.expectEqualStrings("$Lock abc", buffer.next().?);
+    try std.testing.expectEqualStrings("<nick> hi", buffer.next().?);
+    try std.testing.expect(buffer.next() == null);
+}
+
+test "message buffer compacts partial trailing data" {
+    var buffer = NMDC.MessageBuffer{};
+    defer buffer.deinit(std.testing.allocator);
+
+    try buffer.append(std.testing.allocator, "$Hello a|$Supp");
+    try std.testing.expectEqualStrings("$Hello a", buffer.next().?);
+    try std.testing.expect(buffer.next() == null);
+    buffer.compact();
+
+    try std.testing.expectEqualStrings("$Supp", buffer.bytes.items);
+}
+
+test "countNickListEntries counts non-empty nicks" {
+    try std.testing.expectEqual(@as(usize, 3), NMDC.countNickListEntries("alice$$bob$$$$carol$$"));
 }

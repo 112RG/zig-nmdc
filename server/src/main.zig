@@ -20,7 +20,7 @@ pub fn main() !void {
     while (true) {
         // Accept connection
         const connection = try server.accept();
-        std.debug.print("Client connected from: {}\n", .{connection.address});
+        std.debug.print("Client connected from: {any}\n", .{connection.address});
 
         // Handle client in a separate function (blocking for now is fine for a test)
         handleClient(allocator, connection.stream) catch |err| {
@@ -30,7 +30,7 @@ pub fn main() !void {
 }
 
 fn handleClient(allocator: std.mem.Allocator, stream: std.net.Stream) !void {
-    var read_buffer: std.ArrayList(u8) = .empty;
+    var read_buffer = nmdc.MessageBuffer{};
     defer read_buffer.deinit(allocator);
     defer stream.close();
 
@@ -47,20 +47,16 @@ fn handleClient(allocator: std.mem.Allocator, stream: std.net.Stream) !void {
         const bytes_read = try stream.read(buf[0..]);
         if (bytes_read == 0) return;
 
-        try read_buffer.appendSlice(allocator, buf[0..bytes_read]);
+        try read_buffer.append(allocator, buf[0..bytes_read]);
 
-        var start: usize = 0;
-        while (std.mem.indexOfScalarPos(u8, read_buffer.items, start, '|')) |end| {
-            const line = std.mem.trim(u8, read_buffer.items[start..end], "\r\n");
-            start = end + 1;
-
+        while (read_buffer.next()) |line| {
             if (line.len == 0) continue;
             std.debug.print("Received: {s}\n", .{line});
 
             switch (nmdc.parseMessage(line)) {
                 .command => |command| switch (command.kind) {
                     .ValidateNick => {
-                        const hello = try std.fmt.allocPrint(allocator, "$Hello {s}|", .{command.payload});
+                        const hello = try nmdc.makeHello(allocator, command.payload);
                         defer allocator.free(hello);
                         try stream.writeAll(hello);
                         std.debug.print("Sent: {s}\n", .{hello});
@@ -70,11 +66,6 @@ fn handleClient(allocator: std.mem.Allocator, stream: std.net.Stream) !void {
                 else => {},
             }
         }
-
-        if (start == 0) continue;
-
-        const remaining = read_buffer.items.len - start;
-        std.mem.copyForwards(u8, read_buffer.items[0..remaining], read_buffer.items[start..]);
-        read_buffer.items.len = remaining;
+        read_buffer.compact();
     }
 }
